@@ -152,6 +152,18 @@
   // ------------------------------------------------------------ routing
   function readHash() {
     var hash = window.location.hash.replace(/^#/, '');
+    // The hash is the state: start from the defaults, then apply only what
+    // it carries, so a link to the plain board never inherits a filter from
+    // the view before it.
+    state.q = '';
+    state.category = 'all';
+    state.chain = 'all';
+    state.verdict = 'all';
+    state.band = 'all';
+    state.watchlist = false;
+    state.tab = 'pre-token';
+    state.sort = 'implied';
+    state.dir = -1;
     state.selected = null;
     if (!hash) return;
     var parts = hash.split('?');
