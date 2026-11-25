@@ -6,6 +6,10 @@
 
 Token Radar ranks 198 pre-token protocols by what a launch would be worth. Every row carries an implied value built from live comparables — the median market-cap/TVL of the tokened protocols in its own category — adjusted for momentum, maturity and chain concentration, plus a seven-step farm plan generated from the row's own figures. The watchlist is the floor, never the ceiling: 40/40 watchlist protocols covered, and 158 early candidates found below the $50M floor. The dashboard recomputes every number on the page, so what you see is what board.json carries.
 
+## Screenshots
+
+The three screenshots in `screenshots/` are the dashboard itself, captured at 1440×900: `1-board.jpg` is the board sorted by implied value, `2-detail.jpg` is the Gauntlet detail view with the model's walk-through and farm plan, and `3-filtered.jpg` is the board with watchlist-only on and the Risk Curators filter. Each one is a real state of the page, reachable from its own URL hash.
+
 ## Run it
 
 ```sh
