@@ -14,7 +14,7 @@
 //
 //   multiple     = median mcap_usd / tvl_usd of the tokened protocols in the
 //                  same category, computed from the snapshot at runtime;
-//                  the global median when a category has fewer than 3
+//                  the global median when a category has fewer than 5
 //                  comparables, and never more than 10x the global median.
 //   momentum     = clamp(1 + 0.5 * clamp(change_7d / 100, -1, 2), 0.5, 2.0);
 //                  a null change_7d is neutral, 1.0.
@@ -25,7 +25,21 @@
 //   concentration = 0.90 for a single-chain protocol, 1.00 for 2-3 chains,
 //                  1.05 for 4 or more.
 //   implied      = clamp(round(tvl_usd * multiple * momentum * maturity
-//                  * concentration), 1_000_000, 100_000_000_000_000)
+//                  * concentration), 500_000, 100_000_000_000_000)
+//   The $500,000 floor is the lowest round clamp that binds nothing in this
+//   snapshot: the five smallest raw values run $721k-$988k, so the old
+//   $1,000,000 floor tied all five at one value and the board ranked nothing
+//   among them. Every other clamp bound is the v1 value, unchanged.
+//
+//   Every row also carries a P25–P75 interval around its implied value, from
+//   the model's own leave-one-out errors: each tokened protocol is scored
+//   with its own ratio left out of its category's median, and the band is
+//   the middle half of those errors, applied to the row's value. The
+//   interval never moves a rank or a value. The ledger in the dashboard
+//   partitions all 758 protocols the snapshot holds, so the board accounts
+//   for the whole file: watchlist and early rows, the live set, the
+//   tokened protocols set aside, and the pre-token ones each house rule
+//   leaves out.
 //
 // Every factor's formula and bounds are written out in the dashboard's
 // Methodology section and mirrored here. No protocol name is ever
@@ -76,7 +90,7 @@ export interface ModelConstants {
 }
 
 export const MODEL: ModelConstants = {
-  min_comparables: 3,
+  min_comparables: 5,
   multiple_cap_x_global: 10,
   momentum_slope: 0.5,
   momentum_low: 0.5,
@@ -90,7 +104,7 @@ export const MODEL: ModelConstants = {
   concentration_single: 0.9,
   concentration_few: 1.0,
   concentration_many: 1.05,
-  value_floor: 1_000_000,
+  value_floor: 500_000,
   value_ceiling: 100_000_000_000_000,
 };
 
@@ -110,6 +124,33 @@ export interface FarmStep {
 /** A verdict: whether to farm now, watch, or skip, and the decisive reason. */
 export type Verdict = 'Farm now' | 'Watch' | 'Skip';
 
+/** The P10–P90 and P25–P75 multipliers around an implied value, from the
+ *  model's leave-one-out errors on the tokened protocols, plus the
+ *  walk-forward coverage that says how honest the band is. */
+export interface IntervalMultipliers {
+  p10: number;
+  p25: number;
+  p50: number;
+  p75: number;
+  p90: number;
+  loo_n: number;
+  walkforward: {
+    cutoff: string;
+    train_n: number;
+    test_n: number;
+    p25_p75_coverage: number;
+    p10_p90_coverage: number;
+  };
+}
+
+/** One group of the snapshot ledger: where a slice of the protocols went.
+ *  The groups partition the snapshot, so their counts add to its size. */
+export interface LedgerGroup {
+  group: string;
+  count: number;
+  note: string;
+}
+
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
   rank: number;
@@ -126,6 +167,8 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  interval_low_usd: number;
+  interval_high_usd: number;
   model: {
     multiple: number;
     comparables: number;
@@ -154,6 +197,8 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  interval_low_usd: number;
+  interval_high_usd: number;
   multiple: number;
   comparables: number;
   used_global_multiple: boolean;
@@ -192,6 +237,8 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   median_implied_value: number;
+  interval: IntervalMultipliers;
+  ledger: { groups: LedgerGroup[]; total: number };
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -314,7 +361,7 @@ export function computeComparables(snapshot: Snapshot): { byCategory: Map<string
 }
 
 /** The comparable multiple for one protocol's category: its category median
- *  when at least 3 tokened protocols carry one, else the global median. */
+ *  when at least 5 tokened protocols carry one, else the global median. */
 export function comparableMultiple(
   category: string | null,
   comps: { byCategory: Map<string, Comparables>; global: number },
@@ -395,6 +442,172 @@ export function impliedValue(
     concentration,
     age,
   };
+}
+
+// ---------------------------------------------------------------- intervals and ledger
+
+/** A quantile of a sorted ascending array: the index-based pick, the same
+ *  rule ageQuartiles uses, so the same snapshot always yields the same cut. */
+function quantileOfSorted(sorted: number[], q: number): number {
+  return sorted[Math.min(sorted.length - 1, Math.floor(q * (sorted.length - 1)))]!;
+}
+
+/** The median of a sorted ascending array with the element at `idx`
+ *  removed: the leave-one-out median. Removing any copy of a duplicated
+ *  value leaves the same multiset, so the index is enough. */
+function medianMinusOne(sorted: number[], idx: number): number {
+  const n = sorted.length - 1;
+  if (n === 0) return 0;
+  const get = (i: number): number => (i < idx ? sorted[i]! : sorted[i + 1]!);
+  const mid = Math.floor(n / 2);
+  return n % 2 === 1 ? get(mid) : (get(mid - 1) + get(mid)) / 2;
+}
+
+/** One leave-one-out error: the protocol, when it listed, and the log of
+ *  its actual market cap over the model's prediction of it. */
+export interface LooResidual {
+  slug: string;
+  listed_at: string | null;
+  log_residual: number;
+}
+
+/** The model's leave-one-out errors on the tokened protocols: for each one
+ *  whose market cap is known, the model scores it with its own ratio left
+ *  out of its category's median (and out of the global median), then the
+ *  log of actual market cap over the prediction. The category median is
+ *  the leak that matters: a protocol's own ratio sits inside the median
+ *  its row would otherwise use. The prediction is the raw product, no
+ *  floor or ceiling clamp: the clamp is a reporting bound, not a claim
+ *  about the value. The age quartiles stay the snapshot's own, as the
+ *  model uses them at runtime. */
+export function looResiduals(
+  snapshot: Snapshot,
+  quartiles: { q25: number; q75: number; q95: number; median_age: number },
+  model: ModelConstants = MODEL,
+): LooResidual[] {
+  const allRatios: number[] = [];
+  const byCategory = new Map<string, number[]>();
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.tvl_usd === null) continue;
+    if (!(p.mcap_usd > 0) || !(p.tvl_usd > 0)) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    allRatios.push(ratio);
+    const key = p.category ?? 'Other';
+    const list = byCategory.get(key);
+    if (list === undefined) byCategory.set(key, [ratio]);
+    else list.push(ratio);
+  }
+  allRatios.sort((a, b) => a - b);
+  for (const list of byCategory.values()) list.sort((a, b) => a - b);
+  const out: LooResidual[] = [];
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.tvl_usd === null) continue;
+    if (!(p.mcap_usd > 0) || !(p.tvl_usd > 0)) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    const looGlobal = medianMinusOne(allRatios, allRatios.indexOf(ratio));
+    const catList = byCategory.get(p.category ?? 'Other')!;
+    const looCat = medianMinusOne(catList, catList.indexOf(ratio));
+    const multiple =
+      catList.length - 1 >= model.min_comparables
+        ? Math.min(looCat, model.multiple_cap_x_global * looGlobal)
+        : looGlobal;
+    const age = ageDays(snapshot.as_of, p.listed_at);
+    const raw =
+      p.tvl_usd *
+      multiple *
+      momentumFactor(p.change_7d, model) *
+      maturityFactor(age, quartiles, model) *
+      concentrationAdjustment(p.chains, model);
+    out.push({ slug: p.slug, listed_at: p.listed_at, log_residual: Math.log(p.mcap_usd / raw) });
+  }
+  return out;
+}
+
+/** The interval multipliers from the leave-one-out errors, and the
+ *  walk-forward coverage that tests them: the residuals are split by
+ *  listing date at their median, the multipliers are taken from the older
+ *  half, and the coverage is measured on the newer half. Undated
+ *  protocols sit outside the split but inside the multipliers. */
+export function intervalMultipliers(residuals: LooResidual[]): IntervalMultipliers {
+  const logs = residuals.map((r) => r.log_residual).sort((a, b) => a - b);
+  const dated = residuals
+    .filter((r) => r.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : 0));
+  const cutoff = dated[Math.floor(dated.length / 2)]!.listed_at!;
+  const train = dated.filter((r) => r.listed_at! < cutoff);
+  const test = dated.filter((r) => r.listed_at! >= cutoff);
+  const trainLogs = train.map((r) => r.log_residual).sort((a, b) => a - b);
+  const cover = (lo: number, hi: number): number =>
+    test.length === 0 ? 0 : test.filter((r) => r.log_residual >= lo && r.log_residual <= hi).length / test.length;
+  const t25 = quantileOfSorted(trainLogs, 0.25);
+  const t75 = quantileOfSorted(trainLogs, 0.75);
+  const t10 = quantileOfSorted(trainLogs, 0.1);
+  const t90 = quantileOfSorted(trainLogs, 0.9);
+  return {
+    p10: Math.exp(quantileOfSorted(logs, 0.1)),
+    p25: Math.exp(quantileOfSorted(logs, 0.25)),
+    p50: Math.exp(quantileOfSorted(logs, 0.5)),
+    p75: Math.exp(quantileOfSorted(logs, 0.75)),
+    p90: Math.exp(quantileOfSorted(logs, 0.9)),
+    loo_n: residuals.length,
+    walkforward: {
+      cutoff,
+      train_n: train.length,
+      test_n: test.length,
+      p25_p75_coverage: Math.round(cover(t25, t75) * 1000) / 1000,
+      p10_p90_coverage: Math.round(cover(t10, t90) * 1000) / 1000,
+    },
+  };
+}
+
+/** The group one pre-token protocol falls in when the board leaves it out:
+ *  the first house rule it breaks, in the order isRankable checks them.
+ *  A protocol the board ranks never reaches this. */
+function ledgerExclusionGroup(p: SnapshotProtocol): string {
+  const c = p.category;
+  if (c === 'CEX') return 'CEX';
+  if (c === 'Bridge' || c === 'Canonical Bridge') return 'Bridge';
+  if (c === 'Liquid Staking' || c === 'Liquid Restaking' || c === 'Restaked BTC') return 'Liquid Staking';
+  if (VERSIONED.test(p.name)) return 'Versioned name';
+  if (WRAPPED_WORD.test(p.name)) return 'Wrapped or staked name';
+  return 'Exchange name';
+}
+
+/** The snapshot ledger: ten groups that partition every protocol the
+ *  snapshot holds, so the counts add to the snapshot's size and the board
+ *  accounts for the whole file, not just the rows it ranks. */
+export function ledgerGroups(snapshot: Snapshot, board: BoardRow[], live: LiveRow[]): LedgerGroup[] {
+  const boardSlugs = new Set(board.map((r) => r.slug));
+  const liveSlugs = new Set(live.map((r) => r.slug));
+  const watchlist = new Set(snapshot.watchlist);
+  const groups: LedgerGroup[] = [
+    { group: 'Watchlist, on the board', count: 0, note: 'every watchlist slug, ranked' },
+    { group: 'Early candidates, on the board', count: 0, note: 'pre-token protocols the rule keeps' },
+    { group: 'Live token, shown', count: 0, note: 'top 24 by market cap' },
+    { group: 'Tokened, a comparable, set aside', count: 0, note: 'market cap and TVL known, used for the multiples' },
+    { group: 'Tokened, no usable multiple', count: 0, note: 'no market cap on record, or zero' },
+    { group: 'Pre-token, excluded: CEX', count: 0, note: 'an exchange product, not a protocol to farm' },
+    { group: 'Pre-token, excluded: Bridge', count: 0, note: 'a bridge, not a protocol to farm' },
+    { group: 'Pre-token, excluded: Liquid Staking', count: 0, note: 'a staked or restaked product' },
+    { group: 'Pre-token, excluded: Versioned name', count: 0, note: 'a release of another protocol' },
+    { group: 'Pre-token, excluded: Wrapped or staked name', count: 0, note: 'a wrapped or staked product' },
+  ];
+  const byGroup = new Map(groups.map((g) => [g.group, g]));
+  for (const p of snapshot.protocols) {
+    let key: string;
+    if (boardSlugs.has(p.slug)) key = watchlist.has(p.slug) ? 'Watchlist, on the board' : 'Early candidates, on the board';
+    else if (liveSlugs.has(p.slug)) key = 'Live token, shown';
+    else if (!isPreToken(p)) {
+      key =
+        p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0
+          ? 'Tokened, a comparable, set aside'
+          : 'Tokened, no usable multiple';
+    } else key = `Pre-token, excluded: ${ledgerExclusionGroup(p)}`;
+    const g = byGroup.get(key);
+    if (g === undefined) throw new Error(`ledger has no group for ${p.slug} (${key})`);
+    g.count++;
+  }
+  return groups;
 }
 
 // ---------------------------------------------------------------- farm plans
@@ -567,10 +780,15 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
-/** The protocols the board ranks, strongest first, with ranks 1..n. */
+/** The protocols the board ranks, strongest first, with ranks 1..n. The
+ *  interval around each implied value comes from the model's own
+ *  leave-one-out errors on the tokened protocols: the P25–P75 band of
+ *  those errors, applied to the row's implied value. The interval never
+ *  moves a rank or a value: it is a second number on the same row. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const comps = computeComparables(snapshot);
   const quartiles = ageQuartiles(snapshot);
+  const interval = intervalMultipliers(looResiduals(snapshot, quartiles, model));
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries.
@@ -606,6 +824,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     token_status: 'pre-token' as const,
     age_days: s.age,
     implied_value_usd: s.implied,
+    interval_low_usd: Math.round(s.implied * interval.p25),
+    interval_high_usd: Math.round(s.implied * interval.p75),
     model: {
       multiple: s.multiple,
       comparables: s.comparables,
@@ -653,6 +873,8 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    interval_low_usd: row.interval_low_usd,
+    interval_high_usd: row.interval_high_usd,
     multiple: row.model.multiple,
     comparables: row.model.comparables,
     used_global_multiple: row.model.used_global_multiple,
@@ -671,6 +893,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const live = liveRows(snapshot);
   const comps = computeComparables(snapshot);
   const quartiles = ageQuartiles(snapshot);
+  const interval = intervalMultipliers(looResiduals(snapshot, quartiles, model));
+  const ledger = ledgerGroups(snapshot, board, live);
+  const ledgerTotal = ledger.reduce((n, g) => n + g.count, 0);
+  if (ledgerTotal !== snapshot.protocols.length) {
+    throw new Error(`ledger totals ${ledgerTotal}, snapshot holds ${snapshot.protocols.length}`);
+  }
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -688,6 +916,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     early_size: early,
     live_size: live.length,
     median_implied_value: medianOfSorted(board.map((r) => r.implied_value_usd).sort((a, b) => a - b)),
+    interval,
+    ledger: { groups: ledger, total: ledgerTotal },
     rows: board.map((r) => radarRow(r, new Set(snapshot.watchlist))),
     live,
   };
