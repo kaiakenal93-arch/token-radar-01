@@ -537,7 +537,7 @@
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     if (state.selected) {
-      var row = DATA.rows.filter(function (r) { return r.slug === state.selected; })[0];
+      var row = DATA.rows.filter(function (r) { return r.slug.toLowerCase() === String(state.selected).toLowerCase(); })[0];
       if (!row) {
         shell.appendChild(el('div', { class: 'panel' }, el('div', { class: 'empty' },
           el('h2', { text: 'No protocol with that slug' }),
