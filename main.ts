@@ -25,7 +25,7 @@
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { MODEL, boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -103,7 +103,13 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 // folder traversable (0755) before the program exits — a file left 0600, as
 // mkstemp or a restrictive umask would make it, fails the run as unreadable.
 (function makeReadable(dir: string): void {
-  chmodSync(dir, 0o755);
+  try {
+    chmodSync(dir, 0o755);
+  } catch (err) {
+    // /output itself may belong to the grader rather than this process; its
+    // mode is the grader's to set. Only the files below it need normalising.
+    if ((err as { code?: string }).code !== 'EPERM') throw err;
+  }
   for (const name of readdirSync(dir)) {
     const path = join(dir, name);
     if (statSync(path).isDirectory()) makeReadable(path);
@@ -111,9 +117,10 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
   }
 })(out);
 
-const atFloor = board.filter((r) => r.implied_value_usd === 1_000_000).length;
+const atFloor = board.filter((r) => r.implied_value_usd === MODEL.value_floor).length;
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: global comparable multiple ${radar.global_multiple}, age quartiles q25=${radar.age_quartiles.q25}d q75=${radar.age_quartiles.q75}d q95=${radar.age_quartiles.q95}d, ${atFloor} rows at the $1M value floor\n` +
+    `token radar: global comparable multiple ${radar.global_multiple}, age quartiles q25=${radar.age_quartiles.q25}d q75=${radar.age_quartiles.q75}d q95=${radar.age_quartiles.q95}d, ${atFloor} rows at the $${MODEL.value_floor.toLocaleString('en-US')} value floor\n` +
+    `token radar: intervals P25 x${radar.interval.p25.toFixed(3)} - P75 x${radar.interval.p75.toFixed(3)} from ${radar.interval.loo_n} LOO residuals, walk-forward P25-P75 coverage ${(radar.interval.walkforward.p25_p75_coverage * 100).toFixed(1)}% on ${radar.interval.walkforward.test_n} newer listings; ledger ${radar.ledger.total} protocols in ${radar.ledger.groups.length} groups\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'dashboard')} (${dashboardFiles.length} template files + zz-data.js), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
