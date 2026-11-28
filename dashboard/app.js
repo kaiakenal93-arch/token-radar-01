@@ -215,7 +215,7 @@
     for (var i = 2; i < arguments.length; i++) {
       var child = arguments[i];
       if (child === null || child === undefined) continue;
-      if (Array.isArray(child)) child.forEach(function (c) { if (c) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+      if (Array.isArray(child)) child.forEach(function (c) { if (c) node.appendChild(c); });
       else if (typeof child === 'string') node.appendChild(document.createTextNode(child));
       else node.appendChild(child);
     }
@@ -286,6 +286,9 @@
     );
   }
 
+  // Short labels for the ledger bar. Every group the model can emit must be
+  // named here; an unlisted group still renders, as its long name, through
+  // the fallback below — the bar never breaks on a new group.
   function ledgerShort(group) {
     var map = {
       'Watchlist, on the board': 'watchlist',
@@ -297,7 +300,8 @@
       'Pre-token, excluded: Bridge': 'bridge',
       'Pre-token, excluded: Liquid Staking': 'liquid staking',
       'Pre-token, excluded: Versioned name': 'versioned',
-      'Pre-token, excluded: Wrapped or staked name': 'wrapped'
+      'Pre-token, excluded: Wrapped or staked name': 'wrapped',
+      'Pre-token, excluded: Exchange name': 'exchange name'
     };
     return map[group] || group;
   }
@@ -537,7 +541,7 @@
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     if (state.selected) {
-      var row = DATA.rows.filter(function (r) { return r.slug.toLowerCase() === String(state.selected).toLowerCase(); })[0];
+      var row = DATA.rows.filter(function (r) { return r.slug === state.selected; })[0];
       if (!row) {
         shell.appendChild(el('div', { class: 'panel' }, el('div', { class: 'empty' },
           el('h2', { text: 'No protocol with that slug' }),
