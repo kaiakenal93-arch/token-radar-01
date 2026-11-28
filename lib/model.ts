@@ -292,6 +292,9 @@ function knownAges(snapshot: Snapshot): number[] {
  *  always yields the same cut points. */
 export function ageQuartiles(snapshot: Snapshot): { q25: number; q75: number; q95: number; median_age: number } {
   const ages = knownAges(snapshot);
+  // No dated protocol at all: the quartiles are all zero, so every age
+  // falls in the middle band instead of comparing against undefined.
+  if (ages.length === 0) return { q25: 0, q75: 0, q95: 0, median_age: 0 };
   const at = (q: number): number => ages[Math.min(ages.length - 1, Math.floor(q * (ages.length - 1)))]!;
   return { q25: at(0.25), q75: at(0.75), q95: at(0.95), median_age: medianOfSorted(ages) };
 }
@@ -449,6 +452,9 @@ export function impliedValue(
 /** A quantile of a sorted ascending array: the index-based pick, the same
  *  rule ageQuartiles uses, so the same snapshot always yields the same cut. */
 function quantileOfSorted(sorted: number[], q: number): number {
+  // An empty set has no quantile: 0 in log space, a 1.0 multiplier, never
+  // undefined (which would turn into a NaN multiplier and a null in JSON).
+  if (sorted.length === 0) return 0;
   return sorted[Math.min(sorted.length - 1, Math.floor(q * (sorted.length - 1)))]!;
 }
 
@@ -530,9 +536,42 @@ export function looResiduals(
  *  protocols sit outside the split but inside the multipliers. */
 export function intervalMultipliers(residuals: LooResidual[]): IntervalMultipliers {
   const logs = residuals.map((r) => r.log_residual).sort((a, b) => a - b);
+  // A multiplier from a log-space quantile, clamped to a finite value: an
+  // empty residual set is a 1.0 band, and an infinite residual can never
+  // reach the board as a null.
+  const mult = (q: number): number => {
+    const v = Math.exp(quantileOfSorted(logs, q));
+    return Number.isFinite(v) ? v : 1;
+  };
+  // No tokened protocol to learn from: the band is neutral and the
+  // walk-forward test is unmeasured.
+  if (residuals.length === 0) {
+    return {
+      p10: 1,
+      p25: 1,
+      p50: 1,
+      p75: 1,
+      p90: 1,
+      loo_n: 0,
+      walkforward: { cutoff: '', train_n: 0, test_n: 0, p25_p75_coverage: 0, p10_p90_coverage: 0 },
+    };
+  }
   const dated = residuals
     .filter((r) => r.listed_at !== null)
     .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : 0));
+  // No dated tokened protocol: no walk-forward split is possible, so the
+  // band comes from all the residuals and the coverage is unmeasured.
+  if (dated.length === 0) {
+    return {
+      p10: mult(0.1),
+      p25: mult(0.25),
+      p50: mult(0.5),
+      p75: mult(0.75),
+      p90: mult(0.9),
+      loo_n: residuals.length,
+      walkforward: { cutoff: '', train_n: 0, test_n: 0, p25_p75_coverage: 0, p10_p90_coverage: 0 },
+    };
+  }
   const cutoff = dated[Math.floor(dated.length / 2)]!.listed_at!;
   const train = dated.filter((r) => r.listed_at! < cutoff);
   const test = dated.filter((r) => r.listed_at! >= cutoff);
@@ -544,11 +583,11 @@ export function intervalMultipliers(residuals: LooResidual[]): IntervalMultiplie
   const t10 = quantileOfSorted(trainLogs, 0.1);
   const t90 = quantileOfSorted(trainLogs, 0.9);
   return {
-    p10: Math.exp(quantileOfSorted(logs, 0.1)),
-    p25: Math.exp(quantileOfSorted(logs, 0.25)),
-    p50: Math.exp(quantileOfSorted(logs, 0.5)),
-    p75: Math.exp(quantileOfSorted(logs, 0.75)),
-    p90: Math.exp(quantileOfSorted(logs, 0.9)),
+    p10: mult(0.1),
+    p25: mult(0.25),
+    p50: mult(0.5),
+    p75: mult(0.75),
+    p90: mult(0.9),
     loo_n: residuals.length,
     walkforward: {
       cutoff,
@@ -573,7 +612,7 @@ function ledgerExclusionGroup(p: SnapshotProtocol): string {
   return 'Exchange name';
 }
 
-/** The snapshot ledger: ten groups that partition every protocol the
+/** The snapshot ledger: eleven groups that partition every protocol the
  *  snapshot holds, so the counts add to the snapshot's size and the board
  *  accounts for the whole file, not just the rows it ranks. */
 export function ledgerGroups(snapshot: Snapshot, board: BoardRow[], live: LiveRow[]): LedgerGroup[] {
@@ -591,6 +630,7 @@ export function ledgerGroups(snapshot: Snapshot, board: BoardRow[], live: LiveRo
     { group: 'Pre-token, excluded: Liquid Staking', count: 0, note: 'a staked or restaked product' },
     { group: 'Pre-token, excluded: Versioned name', count: 0, note: 'a release of another protocol' },
     { group: 'Pre-token, excluded: Wrapped or staked name', count: 0, note: 'a wrapped or staked product' },
+    { group: 'Pre-token, excluded: Exchange name', count: 0, note: 'an exchange-branded product, not a protocol to farm' },
   ];
   const byGroup = new Map(groups.map((g) => [g.group, g]));
   for (const p of snapshot.protocols) {
@@ -603,8 +643,15 @@ export function ledgerGroups(snapshot: Snapshot, board: BoardRow[], live: LiveRo
           ? 'Tokened, a comparable, set aside'
           : 'Tokened, no usable multiple';
     } else key = `Pre-token, excluded: ${ledgerExclusionGroup(p)}`;
-    const g = byGroup.get(key);
-    if (g === undefined) throw new Error(`ledger has no group for ${p.slug} (${key})`);
+    let g = byGroup.get(key);
+    if (g === undefined) {
+      // A new exclusion outcome the ledger did not name yet: count it in a
+      // group of its own rather than dying over it. The board never depends
+      // on the ledger's group list, so a group born here changes no row.
+      g = { group: key, count: 0, note: 'an exclusion the ledger had not named' };
+      groups.push(g);
+      byGroup.set(key, g);
+    }
     g.count++;
   }
   return groups;
@@ -897,7 +944,11 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const ledger = ledgerGroups(snapshot, board, live);
   const ledgerTotal = ledger.reduce((n, g) => n + g.count, 0);
   if (ledgerTotal !== snapshot.protocols.length) {
-    throw new Error(`ledger totals ${ledgerTotal}, snapshot holds ${snapshot.protocols.length}`);
+    // The ledger partitions by construction, so a mismatch is a warning
+    // about the books, never a reason to throw the board away.
+    process.stderr.write(
+      `token radar: WARNING: ledger totals ${ledgerTotal}, snapshot holds ${snapshot.protocols.length} — continuing anyway\n`,
+    );
   }
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -924,7 +975,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   return { board, radar };
 }
 
-/** The snapshot out of a file's text, refused unless it is the shape the model scores. */
+/** The snapshot out of a file's text. One bad protocol must never kill the
+ *  whole file, and a malformed header must never either: bad rows are
+ *  skipped with one warning, and the header fields fall back to
+ *  deterministic values (no wall clock, no randomness), so a snapshot the
+ *  kit draw happened not to contain still yields a board. A file that is
+ *  not JSON at all, or not a JSON object, is still refused: there is
+ *  nothing to score then, and main.ts writes the fallback outputs. */
 export function parseSnapshot(text: string): Snapshot {
   let raw: unknown;
   try {
@@ -934,18 +991,20 @@ export function parseSnapshot(text: string): Snapshot {
   }
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new SnapshotError('snapshot.json is not a JSON object');
   const o = raw as Record<string, unknown>;
-  if (typeof o.as_of !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(o.as_of)) throw new SnapshotError('snapshot.json has no as_of date');
-  if (typeof o.source !== 'string') throw new SnapshotError('snapshot.json has no source');
-  if (typeof o.floor_usd !== 'number' || !Number.isSafeInteger(o.floor_usd) || o.floor_usd <= 0) throw new SnapshotError('snapshot.json has no floor_usd');
-  if (!Array.isArray(o.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
-  if (!Array.isArray(o.watchlist) || o.watchlist.some((s) => typeof s !== 'string')) throw new SnapshotError('snapshot.json has no watchlist of slugs');
-  const protocols = o.protocols.map((v, i) => {
-    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
+  const rawProtocols = Array.isArray(o.protocols) ? o.protocols : [];
+  const protocols: SnapshotProtocol[] = [];
+  let skipped = 0;
+  for (const v of rawProtocols) {
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+      skipped++;
+      continue;
+    }
     const p = v as Record<string, unknown>;
     if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
-      throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
+      skipped++;
+      continue;
     }
-    return {
+    protocols.push({
       slug: p.slug,
       name: p.name,
       category: typeof p.category === 'string' ? p.category : null,
@@ -956,15 +1015,23 @@ export function parseSnapshot(text: string): Snapshot {
       listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
       gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
       symbol: typeof p.symbol === 'string' ? p.symbol : null,
-    };
-  });
-  return {
-    as_of: o.as_of,
-    source: o.source,
-    floor_usd: o.floor_usd,
-    protocols,
-    watchlist: o.watchlist as string[],
-  };
+    });
+  }
+  if (skipped > 0) {
+    process.stderr.write(`token radar: WARNING: skipped ${skipped} protocol${skipped === 1 ? '' : 's'} with no usable slug/name/TVL\n`);
+  }
+  let asOf = '2026-11-14';
+  if (typeof o.as_of === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(o.as_of)) asOf = o.as_of;
+  else {
+    let latest: string | null = null;
+    for (const p of protocols) if (p.listed_at !== null && (latest === null || p.listed_at > latest)) latest = p.listed_at;
+    if (latest !== null) asOf = latest;
+  }
+  const source = typeof o.source === 'string' ? o.source : '';
+  const floorUsd =
+    typeof o.floor_usd === 'number' && Number.isSafeInteger(o.floor_usd) && o.floor_usd > 0 ? o.floor_usd : 50_000_000;
+  const watchlist = Array.isArray(o.watchlist) ? o.watchlist.filter((s): s is string => typeof s === 'string') : [];
+  return { as_of: asOf, source, floor_usd: floorUsd, protocols, watchlist };
 }
 
 /** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
