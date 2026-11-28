@@ -10,10 +10,12 @@
 // The dashboard is a static page, no framework and no network:
 // dashboard/index.html, dashboard/app.css and dashboard/app.js read the
 // zz-data.js this program writes beside them. The model is the entry's own:
-// category comparables computed from the snapshot at runtime, a bounded
-// momentum factor, a maturity factor on the snapshot's own age quartiles,
-// and a concentration adjustment on chain count. No protocol name is ever
-// special-cased.
+// a hierarchical comparable multiple (category, then family, then global)
+// computed from the snapshot at runtime, a token odds from the peers' own
+// launch record, and a farm verdict that follows from the odds and the
+// break-even farmer share. Every value term is kept or dropped on two
+// held-out tests at runtime, and the dashboard reports the table. No
+// protocol name is ever special-cased.
 //
 // The program runs twice and both runs write the same bytes: no wall-clock
 // time, no unseeded randomness, no network, and every sort has a
@@ -25,7 +27,7 @@
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MODEL, MODEL_VERSION, boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { ALL_TERMS_ON, MODEL, MODEL_VERSION, VERDICT_RULE, boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
 import type { BoardRow, IntervalMultipliers, RadarData, Snapshot } from './lib/model.ts';
 import { DOSSIER_SCHEMA, buildDossier, canonicalJson } from './vendor/makefun-board.ts';
 
@@ -81,12 +83,19 @@ function minimalRadar(asOf: string, source: string, floorUsd: number): RadarData
     model_version: MODEL_VERSION,
     global_multiple: 0,
     comparables: {},
+    families: {},
     age_quartiles: { q25: 0, q75: 0, q95: 0, median_age: 0 },
     watchlist_size: 0,
     board_size: 0,
     early_size: 0,
     live_size: 0,
     median_implied_value: 0,
+    median_token_odds: 0,
+    level_counts: { category: 0, family: 0, global: 0 },
+    verdict_counts: { 'Farm now': 0, Watch: 0, Skip: 0 },
+    verdict_rule: VERDICT_RULE,
+    active_terms: ALL_TERMS_ON,
+    term_tests: [],
     interval: NEUTRAL_INTERVAL,
     ledger: { groups: [], total: 0 },
     rows: [],
@@ -263,10 +272,20 @@ function main(): void {
   makeReadable(out);
 
   const atFloor = board.filter((r) => r.implied_value_usd === MODEL.value_floor).length;
+  const keptTerms = Object.entries(radar.active_terms)
+    .filter(([, on]) => on)
+    .map(([t]) => t)
+    .join(', ');
+  const droppedTerms = Object.entries(radar.active_terms)
+    .filter(([, on]) => !on)
+    .map(([t]) => t)
+    .join(', ');
   process.stdout.write(
     `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
       `token radar: global comparable multiple ${radar.global_multiple}, age quartiles q25=${radar.age_quartiles.q25}d q75=${radar.age_quartiles.q75}d q95=${radar.age_quartiles.q95}d, ${atFloor} rows at the $${MODEL.value_floor.toLocaleString('en-US')} value floor\n` +
       `token radar: intervals P25 x${radar.interval.p25.toFixed(3)} - P75 x${radar.interval.p75.toFixed(3)} from ${radar.interval.loo_n} LOO residuals, walk-forward P25-P75 coverage ${(radar.interval.walkforward.p25_p75_coverage * 100).toFixed(1)}% on ${radar.interval.walkforward.test_n} newer listings; ledger ${radar.ledger.total} protocols in ${radar.ledger.groups.length} groups\n` +
+      `token radar: comparables by level category ${radar.level_counts.category} / family ${radar.level_counts.family} / global ${radar.level_counts.global}, median token odds ${(radar.median_token_odds * 100).toFixed(0)}%, verdicts Farm now ${radar.verdict_counts['Farm now']} / Watch ${radar.verdict_counts.Watch} / Skip ${radar.verdict_counts.Skip}\n` +
+      `token radar: held-out tests kept ${keptTerms || 'nothing'} and dropped ${droppedTerms || 'nothing'}\n` +
       `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'dashboard')} (${dashboardFiles.length} template files + zz-data.js), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
   );
 }
